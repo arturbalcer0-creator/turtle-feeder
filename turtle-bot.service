@@ -1,0 +1,16 @@
+[Unit]
+Description=Turtle feeder Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Поправьте путь и пользователя под свою VM
+WorkingDirectory=/opt/turtle-feeder
+EnvironmentFile=/opt/turtle-feeder/.env
+ExecStart=/opt/turtle-feeder/.venv/bin/python /opt/turtle-feeder/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
