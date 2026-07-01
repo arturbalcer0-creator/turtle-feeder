@@ -17,7 +17,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -74,7 +74,19 @@ def init_db():
             """
         )
         conn.execute("INSERT OR IGNORE INTO state (id) VALUES (1)")
+        # Настройки, редактируемые из чата (хранятся в БД, а не в .env).
+        # env-значения используются только как начальные при первом запуске.
+        _add_column(conn, "feed_interval_days", FEED_INTERVAL_DAYS)
+        _add_column(conn, "remind_every_hours", max(1, round(REMIND_EVERY_MINUTES / 60)))
         conn.commit()
+
+
+def _add_column(conn, col, default):
+    """Добавить колонку в state, если её ещё нет, и заполнить значением по умолчанию."""
+    existing = [r[1] for r in conn.execute("PRAGMA table_info(state)").fetchall()]
+    if col not in existing:
+        conn.execute(f"ALTER TABLE state ADD COLUMN {col} INTEGER")
+        conn.execute(f"UPDATE state SET {col} = ? WHERE {col} IS NULL", (default,))
 
 
 def get_state():
@@ -94,7 +106,8 @@ def set_state(**fields):
 def record_feeding(user_id, user_name):
     """Записать кормление и назначить следующее на +FEED_INTERVAL_DAYS дней."""
     now = datetime.now(TZ)
-    next_date = (now.date() + timedelta(days=FEED_INTERVAL_DAYS)).isoformat()
+    interval = get_state()["feed_interval_days"]
+    next_date = (now.date() + timedelta(days=interval)).isoformat()
     with db() as conn:
         conn.execute(
             "INSERT INTO feedings (user_id, user_name, fed_at) VALUES (?, ?, ?)",
@@ -149,7 +162,10 @@ async def cmd_start(message: Message):
         "Команды:\n"
         "/feed — отметить, что покормили\n"
         "/status — когда следующее кормление\n"
-        "/history — последние кормления",
+        "/history — последние 7 кормлений\n"
+        "/settings — текущие настройки\n"
+        "/interval <дни> — раз в сколько дней кормить\n"
+        "/period <часы> — как часто повторять напоминание",
         reply_markup=FEED_BUTTON,
     )
 
@@ -200,7 +216,7 @@ async def cmd_status(message: Message):
 async def cmd_history(message: Message):
     with db() as conn:
         rows = conn.execute(
-            "SELECT user_name, fed_at FROM feedings ORDER BY id DESC LIMIT 10"
+            "SELECT user_name, fed_at FROM feedings ORDER BY id DESC LIMIT 7"
         ).fetchall()
     if not rows:
         await message.answer("Истории пока нет.")
@@ -209,6 +225,55 @@ async def cmd_history(message: Message):
     for r in rows:
         lines.append(f"• {fmt_dt(r['fed_at'])} — {r['user_name']}")
     await message.answer("\n".join(lines))
+
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message):
+    s = get_state()
+    await message.answer(
+        "Текущие настройки:\n"
+        f"• Кормим раз в {s['feed_interval_days']} дн.\n"
+        f"• Напоминаем каждые {s['remind_every_hours']} ч "
+        f"(в окне {REMIND_START_HOUR}:00–{REMIND_END_HOUR}:00)\n\n"
+        "Изменить:\n"
+        "/interval <дни> — частота кормления\n"
+        "/period <часы> — период напоминаний"
+    )
+
+
+@dp.message(Command("interval"))
+async def cmd_interval(message: Message, command: CommandObject):
+    arg = (command.args or "").strip()
+    if not arg:
+        await message.answer(
+            f"Сейчас кормим раз в {get_state()['feed_interval_days']} дн.\n"
+            "Изменить: /interval <число дней>, например /interval 3"
+        )
+        return
+    if not arg.isdigit() or int(arg) < 1:
+        await message.answer("Нужно целое число дней ≥ 1. Пример: /interval 3")
+        return
+    set_state(feed_interval_days=int(arg))
+    await message.answer(
+        f"Готово: кормим раз в {int(arg)} дн. "
+        "Применится к следующему кормлению (нажмите «Покормил(а)», чтобы пересчитать срок)."
+    )
+
+
+@dp.message(Command("period"))
+async def cmd_period(message: Message, command: CommandObject):
+    arg = (command.args or "").strip()
+    if not arg:
+        await message.answer(
+            f"Сейчас напоминаем каждые {get_state()['remind_every_hours']} ч.\n"
+            "Изменить: /period <число часов>, например /period 3"
+        )
+        return
+    if not arg.isdigit() or int(arg) < 1:
+        await message.answer("Нужно целое число часов ≥ 1. Пример: /period 3")
+        return
+    set_state(remind_every_hours=int(arg))
+    await message.answer(f"Готово: напоминания каждые {int(arg)} ч.")
 
 
 # --- Фоновый цикл напоминаний ---
@@ -237,7 +302,7 @@ async def maybe_remind():
     last = state["last_reminder_at"]
     if last:
         last_dt = datetime.fromisoformat(last)
-        if now - last_dt < timedelta(minutes=REMIND_EVERY_MINUTES):
+        if now - last_dt < timedelta(hours=state["remind_every_hours"]):
             return  # рано для следующего напоминания
 
     await bot.send_message(
