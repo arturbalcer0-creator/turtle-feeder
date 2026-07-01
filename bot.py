@@ -106,9 +106,13 @@ def set_state(**fields):
         conn.commit()
 
 
-def record_feeding(user_id, user_name):
-    """Записать кормление и назначить следующее на +FEED_INTERVAL_DAYS дней."""
-    now = datetime.now(TZ)
+def record_feeding(user_id, user_name, when=None):
+    """Записать кормление и назначить следующее через feed_interval_days дней.
+
+    when — момент кормления (datetime с TZ); по умолчанию сейчас.
+    Позволяет задать «дату последнего кормления» задним числом.
+    """
+    now = when or datetime.now(TZ)
     interval = get_state()["feed_interval_days"]
     next_date = (now.date() + timedelta(days=interval)).isoformat()
     with db() as conn:
@@ -186,7 +190,45 @@ def settings_kb():
                 InlineKeyboardButton(text=f"🔔 {s['remind_every_hours']} ч", callback_data="noop"),
                 InlineKeyboardButton(text="➕", callback_data="s:period:1"),
             ],
+            [InlineKeyboardButton(text="📅 Задать дату кормления", callback_data="d:pick")],
             [InlineKeyboardButton(text="✖️ Закрыть", callback_data="s:close")],
+        ]
+    )
+
+
+def picker_text(iso):
+    d = date.fromisoformat(iso)
+    interval = get_state()["feed_interval_days"]
+    nxt = d + timedelta(days=interval)
+    return (
+        "📅 Когда Сашу покормили последний раз?\n"
+        f"Выбрано: {d.strftime('%d.%m.%Y')}\n"
+        f"Следующее кормление станет: {nxt.strftime('%d.%m.%Y')}\n\n"
+        "Листайте стрелками и нажмите «Подтвердить»."
+    )
+
+
+def picker_kb(iso):
+    """Выбор даты стрелками ±1 день и ±1 неделя, без ввода текста."""
+    d = date.fromisoformat(iso)
+    today = datetime.now(TZ).date()
+    prev7 = (d - timedelta(days=7)).isoformat()
+    prev1 = (d - timedelta(days=1)).isoformat()
+    next1 = min(today, d + timedelta(days=1)).isoformat()
+    next7 = min(today, d + timedelta(days=7)).isoformat()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⏪", callback_data=f"d:nav:{prev7}"),
+                InlineKeyboardButton(text="◀️", callback_data=f"d:nav:{prev1}"),
+                InlineKeyboardButton(text=d.strftime("%d.%m"), callback_data="noop"),
+                InlineKeyboardButton(text="▶️", callback_data=f"d:nav:{next1}"),
+                InlineKeyboardButton(text="⏩", callback_data=f"d:nav:{next7}"),
+            ],
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"d:ok:{iso}"),
+                InlineKeyboardButton(text="✖️ Отмена", callback_data="d:cancel"),
+            ],
         ]
     )
 
@@ -402,6 +444,39 @@ async def cb_settings_change(callback: CallbackQuery):
     except Exception:
         pass  # значение упёрлось в границу — клавиатура не изменилась, это ок
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("d:"))
+async def cb_date(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    action = parts[1]
+    if action == "cancel":
+        await callback.message.delete()
+        await callback.answer()
+        return
+    if action == "pick":
+        today = datetime.now(TZ).date().isoformat()
+        await callback.message.answer(picker_text(today), reply_markup=picker_kb(today))
+        await callback.answer()
+        return
+    iso = parts[2]
+    if action == "nav":
+        try:
+            await callback.message.edit_text(picker_text(iso), reply_markup=picker_kb(iso))
+        except Exception:
+            pass  # дошли до сегодня — дата не изменилась, это ок
+        await callback.answer()
+        return
+    if action == "ok":
+        d = date.fromisoformat(iso)
+        when = datetime(d.year, d.month, d.day, 12, 0, tzinfo=TZ)
+        record_feeding(callback.from_user.id, callback.from_user.full_name, when=when)
+        nxt = date.fromisoformat(get_state()["next_feed_date"])
+        await callback.message.edit_text(
+            f"✅ Отмечено кормление {d.strftime('%d.%m.%Y')}.\n"
+            f"Следующее кормление — {nxt.strftime('%d.%m.%Y')}."
+        )
+        await callback.answer("Готово")
 
 
 # --- Фоновый цикл напоминаний ---
