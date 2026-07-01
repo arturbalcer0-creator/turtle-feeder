@@ -78,6 +78,17 @@ def init_db():
             )
             """
         )
+        # Чистка аквариума — просто журнал (без расписания и напоминаний).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cleanings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                user_name TEXT,
+                cleaned_at TEXT NOT NULL
+            )
+            """
+        )
         conn.execute("INSERT OR IGNORE INTO state (id) VALUES (1)")
         # Настройки, редактируемые из чата (хранятся в БД, а не в .env).
         # env-значения используются только как начальные при первом запуске.
@@ -165,19 +176,36 @@ def last_feeding():
         ).fetchone()
 
 
+def record_cleaning(user_id, user_name):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO cleanings (user_id, user_name, cleaned_at) VALUES (?, ?, ?)",
+            (user_id, user_name, datetime.now(TZ).isoformat()),
+        )
+        conn.commit()
+
+
+def last_cleaning():
+    with db() as conn:
+        return conn.execute(
+            "SELECT user_name, cleaned_at FROM cleanings ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+
 # --- Клавиатуры и точки входа ---
 # Метки кнопок нижней клавиатуры (вариант C). Их же текст ловим в обработчиках.
 BTN_FEED = "🐢 Покормил(а)"
 BTN_STATUS = "📊 Статус"
 BTN_HISTORY = "📜 История"
 BTN_SETTINGS = "⚙️ Настройки"
+BTN_AQUA = "🧽 Аквариум"
 
 # Нижняя клавиатура — постоянная, всегда под рукой.
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_FEED)],
         [KeyboardButton(text=BTN_STATUS), KeyboardButton(text=BTN_HISTORY)],
-        [KeyboardButton(text=BTN_SETTINGS)],
+        [KeyboardButton(text=BTN_AQUA), KeyboardButton(text=BTN_SETTINGS)],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -219,6 +247,17 @@ def panel_kb():
                 InlineKeyboardButton(text=BTN_SETTINGS, callback_data="m:settings"),
                 InlineKeyboardButton(text="📈 Статистика", callback_data="m:stats"),
             ],
+            [InlineKeyboardButton(text=BTN_AQUA, callback_data="aqua")],
+        ]
+    )
+
+
+def aquarium_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🧽 Почистил(а)", callback_data="aqua:done")],
+            [InlineKeyboardButton(text="📜 История чисток", callback_data="aqua:hist")],
+            [InlineKeyboardButton(text="✖️ Закрыть", callback_data="aqua:close")],
         ]
     )
 
@@ -384,6 +423,32 @@ def history_text():
     return "\n".join(lines)
 
 
+def aquarium_text():
+    last = last_cleaning()
+    if last:
+        info = f"Последняя чистка: {last['user_name']} — {fmt_dt(last['cleaned_at'])}"
+    else:
+        info = "Чисток ещё не было."
+    return (
+        "🧽 Аквариум\n"
+        f"{info}\n\n"
+        "Чистим по состоянию, без расписания. Отметьте, когда почистите."
+    )
+
+
+def cleaning_history_text():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT user_name, cleaned_at FROM cleanings ORDER BY id DESC LIMIT 7"
+        ).fetchall()
+    if not rows:
+        return "Чисток пока не было."
+    lines = ["Последние чистки аквариума:"]
+    for r in rows:
+        lines.append(f"• {fmt_dt(r['cleaned_at'])} — {r['user_name']}")
+    return "\n".join(lines)
+
+
 def settings_text():
     return (
         "⚙️ Настройки\n\n"
@@ -471,6 +536,11 @@ async def cmd_undo(message: Message):
     await do_undo(message.answer)
 
 
+@dp.message(Command("aquarium"))
+async def cmd_aquarium(message: Message):
+    await message.answer(aquarium_text(), reply_markup=aquarium_kb())
+
+
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
     await message.answer(settings_text(), reply_markup=settings_kb())
@@ -532,6 +602,11 @@ async def kb_settings(message: Message):
     await message.answer(settings_text(), reply_markup=settings_kb())
 
 
+@dp.message(F.text == BTN_AQUA)
+async def kb_aquarium(message: Message):
+    await message.answer(aquarium_text(), reply_markup=aquarium_kb())
+
+
 # --- Inline-кнопки (вариант B: панель и напоминания) ---
 @dp.callback_query(F.data == "fed")
 async def cb_fed(callback: CallbackQuery):
@@ -562,6 +637,27 @@ async def cb_m_settings(callback: CallbackQuery):
 async def cb_m_stats(callback: CallbackQuery):
     await callback.message.answer(stats_text())
     await callback.answer()
+
+
+@dp.callback_query(F.data == "aqua")
+async def cb_aqua_open(callback: CallbackQuery):
+    await callback.message.answer(aquarium_text(), reply_markup=aquarium_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("aqua:"))
+async def cb_aqua(callback: CallbackQuery):
+    action = callback.data.split(":")[1]
+    if action == "done":
+        record_cleaning(callback.from_user.id, callback.from_user.full_name)
+        await callback.message.edit_text(aquarium_text(), reply_markup=aquarium_kb())
+        await callback.answer("Записал!")
+    elif action == "hist":
+        await callback.message.answer(cleaning_history_text())
+        await callback.answer()
+    elif action == "close":
+        await callback.message.delete()
+        await callback.answer()
 
 
 @dp.callback_query(F.data == "undo")
@@ -716,6 +812,7 @@ async def set_commands():
             BotCommand(command="history", description="📜 Последние кормления"),
             BotCommand(command="stats", description="📈 Статистика за месяц"),
             BotCommand(command="undo", description="↩️ Отменить последнее кормление"),
+            BotCommand(command="aquarium", description="🧽 Аквариум (чистка)"),
             BotCommand(command="settings", description="⚙️ Настройки"),
             BotCommand(command="menu", description="📋 Панель с кнопками"),
         ]
