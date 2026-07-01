@@ -226,19 +226,19 @@ def settings_kb():
     s = get_state()
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text=f"🍽 Кормить: {s['feed_interval_days']} дн", callback_data="noop")],
             [
                 InlineKeyboardButton(text="➖", callback_data="s:interval:-1"),
-                InlineKeyboardButton(text=f"🍽 Кормить: {s['feed_interval_days']} дн", callback_data="noop"),
                 InlineKeyboardButton(text="➕", callback_data="s:interval:1"),
             ],
+            [InlineKeyboardButton(text=f"🔔 Напоминать: {s['remind_every_hours']} ч", callback_data="noop")],
             [
                 InlineKeyboardButton(text="➖", callback_data="s:period:-1"),
-                InlineKeyboardButton(text=f"🔔 Напоминать: {s['remind_every_hours']} ч", callback_data="noop"),
                 InlineKeyboardButton(text="➕", callback_data="s:period:1"),
             ],
+            [InlineKeyboardButton(text=f"😴 Позже: {s['snooze_hours']} ч", callback_data="noop")],
             [
                 InlineKeyboardButton(text="➖", callback_data="s:snooze:-1"),
-                InlineKeyboardButton(text=f"😴 Позже: {s['snooze_hours']} ч", callback_data="noop"),
                 InlineKeyboardButton(text="➕", callback_data="s:snooze:1"),
             ],
             [InlineKeyboardButton(text="📅 Задать дату кормления", callback_data="d:pick")],
