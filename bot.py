@@ -228,17 +228,17 @@ def settings_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="➖", callback_data="s:interval:-1"),
-                InlineKeyboardButton(text=f"🍽 {s['feed_interval_days']} дн", callback_data="noop"),
+                InlineKeyboardButton(text=f"🍽 Кормить: {s['feed_interval_days']} дн", callback_data="noop"),
                 InlineKeyboardButton(text="➕", callback_data="s:interval:1"),
             ],
             [
                 InlineKeyboardButton(text="➖", callback_data="s:period:-1"),
-                InlineKeyboardButton(text=f"🔔 {s['remind_every_hours']} ч", callback_data="noop"),
+                InlineKeyboardButton(text=f"🔔 Напоминать: {s['remind_every_hours']} ч", callback_data="noop"),
                 InlineKeyboardButton(text="➕", callback_data="s:period:1"),
             ],
             [
                 InlineKeyboardButton(text="➖", callback_data="s:snooze:-1"),
-                InlineKeyboardButton(text=f"😴 {s['snooze_hours']} ч", callback_data="noop"),
+                InlineKeyboardButton(text=f"😴 Позже: {s['snooze_hours']} ч", callback_data="noop"),
                 InlineKeyboardButton(text="➕", callback_data="s:snooze:1"),
             ],
             [InlineKeyboardButton(text="📅 Задать дату кормления", callback_data="d:pick")],
@@ -384,11 +384,9 @@ def history_text():
 
 def settings_text():
     return (
-        "⚙️ Настройки\n"
-        "🍽 Кормить раз в N дней\n"
-        f"🔔 Напоминать раз в N часов (окно {REMIND_START_HOUR}:00–{REMIND_END_HOUR}:00)\n"
-        "😴 «Позже» откладывает на N часов\n\n"
-        "Меняйте значения кнопками − / + ниже:"
+        "⚙️ Настройки\n\n"
+        "Меняйте значения кнопками − / + ниже.\n"
+        f"Напоминания приходят в окне {REMIND_START_HOUR}:00–{REMIND_END_HOUR}:00."
     )
 
 
