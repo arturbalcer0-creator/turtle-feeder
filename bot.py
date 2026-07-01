@@ -81,6 +81,7 @@ def init_db():
         # env-значения используются только как начальные при первом запуске.
         _add_column(conn, "feed_interval_days", FEED_INTERVAL_DAYS)
         _add_column(conn, "remind_every_hours", max(1, round(REMIND_EVERY_MINUTES / 60)))
+        _add_column(conn, "snooze_hours", 2)
         # Пауза/снуз: до этого момента напоминания молчат (ISO datetime или NULL).
         _add_column(conn, "mute_until", None, "TEXT")
         conn.commit()
@@ -190,13 +191,15 @@ UNDO_BUTTON = InlineKeyboardMarkup(
     inline_keyboard=[[InlineKeyboardButton(text="↩️ Отменить", callback_data="undo")]]
 )
 
-# Клавиатура напоминания: покормить + отложить.
-REMINDER_KB = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [InlineKeyboardButton(text=BTN_FEED, callback_data="fed")],
-        [InlineKeyboardButton(text="😴 Позже (2 ч)", callback_data="snooze")],
-    ]
-)
+def reminder_kb():
+    """Клавиатура напоминания: покормить + отложить на настраиваемый срок."""
+    hours = get_state()["snooze_hours"]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=BTN_FEED, callback_data="fed")],
+            [InlineKeyboardButton(text=f"😴 Позже ({hours} ч)", callback_data="snooze")],
+        ]
+    )
 
 PANEL_TEXT = "🐢 Панель кормления Саши\nВыберите действие (это сообщение можно закрепить):"
 
@@ -232,6 +235,11 @@ def settings_kb():
                 InlineKeyboardButton(text="➖", callback_data="s:period:-1"),
                 InlineKeyboardButton(text=f"🔔 {s['remind_every_hours']} ч", callback_data="noop"),
                 InlineKeyboardButton(text="➕", callback_data="s:period:1"),
+            ],
+            [
+                InlineKeyboardButton(text="➖", callback_data="s:snooze:-1"),
+                InlineKeyboardButton(text=f"😴 {s['snooze_hours']} ч", callback_data="noop"),
+                InlineKeyboardButton(text="➕", callback_data="s:snooze:1"),
             ],
             [InlineKeyboardButton(text="📅 Задать дату кормления", callback_data="d:pick")],
             [InlineKeyboardButton(text="⏸ Пауза (отпуск)", callback_data="p:menu")],
@@ -378,7 +386,8 @@ def settings_text():
     return (
         "⚙️ Настройки\n"
         "🍽 Кормить раз в N дней\n"
-        f"🔔 Напоминать раз в N часов (окно {REMIND_START_HOUR}:00–{REMIND_END_HOUR}:00)\n\n"
+        f"🔔 Напоминать раз в N часов (окно {REMIND_START_HOUR}:00–{REMIND_END_HOUR}:00)\n"
+        "😴 «Позже» откладывает на N часов\n\n"
         "Меняйте значения кнопками − / + ниже:"
     )
 
@@ -563,10 +572,11 @@ async def cb_undo(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "snooze")
 async def cb_snooze(callback: CallbackQuery):
-    until = datetime.now(TZ) + timedelta(hours=2)
+    hours = get_state()["snooze_hours"]
+    until = datetime.now(TZ) + timedelta(hours=hours)
     set_state(mute_until=until.isoformat())
-    await callback.message.edit_text("😴 Отложено на 2 часа. Напомню позже.")
-    await callback.answer("Напомню через 2 часа")
+    await callback.message.edit_text(f"😴 Отложено на {hours} ч. Напомню позже.")
+    await callback.answer(f"Напомню через {hours} ч")
 
 
 @dp.callback_query(F.data.startswith("p:"))
@@ -603,8 +613,10 @@ async def cb_settings_change(callback: CallbackQuery):
     s = get_state()
     if field == "interval":
         set_state(feed_interval_days=min(30, max(1, s["feed_interval_days"] + delta)))
-    else:
+    elif field == "period":
         set_state(remind_every_hours=min(24, max(1, s["remind_every_hours"] + delta)))
+    else:
+        set_state(snooze_hours=min(12, max(1, s["snooze_hours"] + delta)))
     try:
         await callback.message.edit_reply_markup(reply_markup=settings_kb())
     except Exception:
@@ -687,7 +699,7 @@ async def maybe_remind():
     else:
         text = f"‼️ Сашу не кормили — уже на {days_late} дн. дольше срока! Он голодает 🐢"
 
-    await bot.send_message(state["chat_id"], text, reply_markup=REMINDER_KB)
+    await bot.send_message(state["chat_id"], text, reply_markup=reminder_kb())
     set_state(last_reminder_at=now.isoformat())
     log.info("Отправлено напоминание в чат %s (просрочка %s дн.)", state["chat_id"], days_late)
 
