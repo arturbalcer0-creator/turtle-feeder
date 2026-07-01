@@ -17,6 +17,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BotCommand,
@@ -43,7 +44,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("turtle")
 
-bot = Bot(token=BOT_TOKEN)
+# По умолчанию все сообщения бота — без звука. Со звуком шлём только напоминания.
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(disable_notification=True))
 dp = Dispatcher()
 
 
@@ -697,7 +699,10 @@ async def maybe_remind():
     else:
         text = f"‼️ Сашу не кормили — уже на {days_late} дн. дольше срока! Он голодает 🐢"
 
-    await bot.send_message(state["chat_id"], text, reply_markup=reminder_kb())
+    # Единственное сообщение со звуком — само напоминание.
+    await bot.send_message(
+        state["chat_id"], text, reply_markup=reminder_kb(), disable_notification=False
+    )
     set_state(last_reminder_at=now.isoformat())
     log.info("Отправлено напоминание в чат %s (просрочка %s дн.)", state["chat_id"], days_late)
 
