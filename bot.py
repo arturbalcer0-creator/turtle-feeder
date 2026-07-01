@@ -81,15 +81,18 @@ def init_db():
         # env-значения используются только как начальные при первом запуске.
         _add_column(conn, "feed_interval_days", FEED_INTERVAL_DAYS)
         _add_column(conn, "remind_every_hours", max(1, round(REMIND_EVERY_MINUTES / 60)))
+        # Пауза/снуз: до этого момента напоминания молчат (ISO datetime или NULL).
+        _add_column(conn, "mute_until", None, "TEXT")
         conn.commit()
 
 
-def _add_column(conn, col, default):
+def _add_column(conn, col, default, coltype="INTEGER"):
     """Добавить колонку в state, если её ещё нет, и заполнить значением по умолчанию."""
     existing = [r[1] for r in conn.execute("PRAGMA table_info(state)").fetchall()]
     if col not in existing:
-        conn.execute(f"ALTER TABLE state ADD COLUMN {col} INTEGER")
-        conn.execute(f"UPDATE state SET {col} = ? WHERE {col} IS NULL", (default,))
+        conn.execute(f"ALTER TABLE state ADD COLUMN {col} {coltype}")
+        if default is not None:
+            conn.execute(f"UPDATE state SET {col} = ? WHERE {col} IS NULL", (default,))
 
 
 def get_state():
@@ -121,7 +124,31 @@ def record_feeding(user_id, user_name, when=None):
             (user_id, user_name, now.isoformat()),
         )
         conn.execute(
-            "UPDATE state SET next_feed_date = ?, last_reminder_at = NULL WHERE id = 1",
+            "UPDATE state SET next_feed_date = ?, last_reminder_at = NULL, mute_until = NULL"
+            " WHERE id = 1",
+            (next_date,),
+        )
+        conn.commit()
+    return next_date
+
+
+def undo_last_feeding():
+    """Удалить последнее кормление и пересчитать срок по предыдущему. None — если пусто."""
+    with db() as conn:
+        row = conn.execute("SELECT id FROM feedings ORDER BY id DESC LIMIT 1").fetchone()
+        if not row:
+            return None
+        conn.execute("DELETE FROM feedings WHERE id = ?", (row["id"],))
+        prev = conn.execute("SELECT fed_at FROM feedings ORDER BY id DESC LIMIT 1").fetchone()
+        interval = conn.execute("SELECT feed_interval_days FROM state WHERE id = 1").fetchone()[0]
+        if prev:
+            prev_date = datetime.fromisoformat(prev["fed_at"]).astimezone(TZ).date()
+            next_date = (prev_date + timedelta(days=interval)).isoformat()
+        else:
+            next_date = datetime.now(TZ).date().isoformat()  # истории нет — считаем, что пора
+        conn.execute(
+            "UPDATE state SET next_feed_date = ?, last_reminder_at = NULL, mute_until = NULL"
+            " WHERE id = 1",
             (next_date,),
         )
         conn.commit()
@@ -153,9 +180,22 @@ MAIN_KB = ReplyKeyboardMarkup(
     is_persistent=True,
 )
 
-# Одна кнопка «Покормил(а)» — вешается на напоминания и ответы со статусом.
+# Одна кнопка «Покормил(а)» — вешается на ответы со статусом.
 FEED_BUTTON = InlineKeyboardMarkup(
     inline_keyboard=[[InlineKeyboardButton(text=BTN_FEED, callback_data="fed")]]
+)
+
+# Кнопка отмены — показывается под подтверждением кормления.
+UNDO_BUTTON = InlineKeyboardMarkup(
+    inline_keyboard=[[InlineKeyboardButton(text="↩️ Отменить", callback_data="undo")]]
+)
+
+# Клавиатура напоминания: покормить + отложить.
+REMINDER_KB = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text=BTN_FEED, callback_data="fed")],
+        [InlineKeyboardButton(text="😴 Позже (2 ч)", callback_data="snooze")],
+    ]
 )
 
 PANEL_TEXT = "🐢 Панель кормления Саши\nВыберите действие (это сообщение можно закрепить):"
@@ -170,7 +210,10 @@ def panel_kb():
                 InlineKeyboardButton(text=BTN_STATUS, callback_data="m:status"),
                 InlineKeyboardButton(text=BTN_HISTORY, callback_data="m:history"),
             ],
-            [InlineKeyboardButton(text=BTN_SETTINGS, callback_data="m:settings")],
+            [
+                InlineKeyboardButton(text=BTN_SETTINGS, callback_data="m:settings"),
+                InlineKeyboardButton(text="📈 Статистика", callback_data="m:stats"),
+            ],
         ]
     )
 
@@ -191,7 +234,23 @@ def settings_kb():
                 InlineKeyboardButton(text="➕", callback_data="s:period:1"),
             ],
             [InlineKeyboardButton(text="📅 Задать дату кормления", callback_data="d:pick")],
+            [InlineKeyboardButton(text="⏸ Пауза (отпуск)", callback_data="p:menu")],
             [InlineKeyboardButton(text="✖️ Закрыть", callback_data="s:close")],
+        ]
+    )
+
+
+def pause_kb():
+    """Меню паузы: быстрые варианты и снятие."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="3 дня", callback_data="p:days:3"),
+                InlineKeyboardButton(text="1 неделя", callback_data="p:days:7"),
+                InlineKeyboardButton(text="2 недели", callback_data="p:days:14"),
+            ],
+            [InlineKeyboardButton(text="▶️ Снять паузу", callback_data="p:off")],
+            [InlineKeyboardButton(text="✖️ Закрыть", callback_data="p:close")],
         ]
     )
 
@@ -253,12 +312,53 @@ def status_text():
     if state["next_feed_date"]:
         nd = date.fromisoformat(state["next_feed_date"])
         today = datetime.now(TZ).date()
-        if today >= nd:
-            lines.append("Пора кормить! 🐢")
+        days_late = (today - nd).days
+        if days_late > 0:
+            lines.append(f"⚠️ Просрочено на {days_late} дн. — пора кормить!")
+        elif days_late == 0:
+            lines.append("Пора кормить сегодня 🐢")
         else:
-            days = (nd - today).days
-            lines.append(f"Следующее кормление — {nd.strftime('%d.%m.%Y')} (через {days} дн.)")
+            lines.append(f"Следующее кормление — {nd.strftime('%d.%m.%Y')} (через {-days_late} дн.)")
+    mute = state["mute_until"]
+    if mute and datetime.now(TZ) < datetime.fromisoformat(mute):
+        lines.append(f"⏸ На паузе до {fmt_dt(mute)}")
     return "\n".join(lines)
+
+
+def stats_text():
+    cutoff = (datetime.now(TZ) - timedelta(days=30)).isoformat()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT fed_at FROM feedings WHERE fed_at >= ? ORDER BY id DESC", (cutoff,)
+        ).fetchall()
+    if len(rows) < 2:
+        return "📈 Пока мало данных за месяц (нужно ≥2 кормлений)."
+    times = [datetime.fromisoformat(r["fed_at"]) for r in rows]  # от новых к старым
+    diffs = [(times[i] - times[i + 1]).total_seconds() / 86400 for i in range(len(times) - 1)]
+    avg = sum(diffs) / len(diffs)
+    interval = get_state()["feed_interval_days"]
+    verdict = "в графике 👍" if avg <= interval + 0.5 else "реже, чем нужно ⚠️"
+    return (
+        f"📈 За последние 30 дней — {len(rows)} кормлений.\n"
+        f"Средний интервал: {avg:.1f} дн. (цель {interval}).\n"
+        f"Итог: {verdict}"
+    )
+
+
+def pause_text():
+    state = get_state()
+    mute = state["mute_until"]
+    now = datetime.now(TZ)
+    if mute and now < datetime.fromisoformat(mute):
+        status = f"Сейчас на паузе до {fmt_dt(mute)}."
+    else:
+        status = "Сейчас пауза не активна."
+    return (
+        "⏸ Пауза напоминаний (например, на отпуск).\n"
+        f"{status}\n\n"
+        "Выберите срок паузы. Вернувшись, задайте дату последнего кормления "
+        "в настройках, чтобы поправить отсчёт."
+    )
 
 
 def history_text():
@@ -288,7 +388,25 @@ async def do_feed(user_id, user_name, answer):
     next_human = datetime.fromisoformat(next_date).strftime("%d.%m.%Y")
     await answer(
         f"Готово! {user_name} покормил(а) Сашу 🐢\n"
-        f"Следующее кормление — {next_human}."
+        f"Следующее кормление — {next_human}.",
+        reply_markup=UNDO_BUTTON,
+    )
+
+
+async def do_undo(answer):
+    next_date = undo_last_feeding()
+    if next_date is None:
+        await answer("Отменять нечего — история кормлений пуста.")
+        return
+    last = last_feeding()
+    tail = (
+        f"Теперь последнее: {last['user_name']} — {fmt_dt(last['fed_at'])}."
+        if last
+        else "История теперь пуста — считаю, что пора кормить."
+    )
+    await answer(
+        "↩️ Последнее кормление отменено.\n"
+        f"Следующее — {date.fromisoformat(next_date).strftime('%d.%m.%Y')}.\n{tail}"
     )
 
 
@@ -332,6 +450,16 @@ async def cmd_status(message: Message):
 @dp.message(Command("history"))
 async def cmd_history(message: Message):
     await message.answer(history_text())
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    await message.answer(stats_text())
+
+
+@dp.message(Command("undo"))
+async def cmd_undo(message: Message):
+    await do_undo(message.answer)
 
 
 @dp.message(Command("settings"))
@@ -421,6 +549,44 @@ async def cb_m_settings(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "m:stats")
+async def cb_m_stats(callback: CallbackQuery):
+    await callback.message.answer(stats_text())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "undo")
+async def cb_undo(callback: CallbackQuery):
+    await do_undo(callback.message.answer)
+    await callback.answer("Отменено")
+
+
+@dp.callback_query(F.data == "snooze")
+async def cb_snooze(callback: CallbackQuery):
+    until = datetime.now(TZ) + timedelta(hours=2)
+    set_state(mute_until=until.isoformat())
+    await callback.message.edit_text("😴 Отложено на 2 часа. Напомню позже.")
+    await callback.answer("Напомню через 2 часа")
+
+
+@dp.callback_query(F.data.startswith("p:"))
+async def cb_pause(callback: CallbackQuery):
+    action = callback.data.split(":")[1]
+    if action == "menu":
+        await callback.message.answer(pause_text(), reply_markup=pause_kb())
+    elif action == "close":
+        await callback.message.delete()
+    elif action == "off":
+        set_state(mute_until=None)
+        await callback.message.edit_text("▶️ Пауза снята. Напоминания снова активны.")
+    elif action == "days":
+        days = int(callback.data.split(":")[2])
+        until = datetime.now(TZ) + timedelta(days=days)
+        set_state(mute_until=until.isoformat())
+        await callback.message.edit_text(f"⏸ Пауза до {fmt_dt(until.isoformat())}.")
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "noop")
 async def cb_noop(callback: CallbackQuery):
     await callback.answer()
@@ -495,11 +661,17 @@ async def maybe_remind():
         return
 
     now = datetime.now(TZ)
+
+    mute = state["mute_until"]
+    if mute and now < datetime.fromisoformat(mute):
+        return  # пауза или отложено
+
     if not in_reminder_window(now):
         return
 
     next_date = date.fromisoformat(state["next_feed_date"])
-    if now.date() < next_date:
+    days_late = (now.date() - next_date).days
+    if days_late < 0:
         return  # ещё не пора
 
     last = state["last_reminder_at"]
@@ -508,13 +680,16 @@ async def maybe_remind():
         if now - last_dt < timedelta(hours=state["remind_every_hours"]):
             return  # рано для следующего напоминания
 
-    await bot.send_message(
-        state["chat_id"],
-        "🐢 Пора покормить Сашу! Нажмите кнопку, когда покормите.",
-        reply_markup=FEED_BUTTON,
-    )
+    if days_late == 0:
+        text = "🐢 Пора покормить Сашу! Нажмите кнопку, когда покормите."
+    elif days_late == 1:
+        text = "⚠️ Сашу пора было покормить ещё вчера! Уже на 1 день дольше срока."
+    else:
+        text = f"‼️ Сашу не кормили — уже на {days_late} дн. дольше срока! Он голодает 🐢"
+
+    await bot.send_message(state["chat_id"], text, reply_markup=REMINDER_KB)
     set_state(last_reminder_at=now.isoformat())
-    log.info("Отправлено напоминание в чат %s", state["chat_id"])
+    log.info("Отправлено напоминание в чат %s (просрочка %s дн.)", state["chat_id"], days_late)
 
 
 # --- Точка входа ---
@@ -524,6 +699,8 @@ async def set_commands():
             BotCommand(command="feed", description="🐢 Отметить кормление"),
             BotCommand(command="status", description="📊 Когда следующее кормление"),
             BotCommand(command="history", description="📜 Последние кормления"),
+            BotCommand(command="stats", description="📈 Статистика за месяц"),
+            BotCommand(command="undo", description="↩️ Отменить последнее кормление"),
             BotCommand(command="settings", description="⚙️ Настройки"),
             BotCommand(command="menu", description="📋 Панель с кнопками"),
         ]
