@@ -19,10 +19,13 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 # --- Конфигурация (через переменные окружения) ---
@@ -128,12 +131,64 @@ def last_feeding():
         ).fetchone()
 
 
-# --- Вспомогательное ---
-FEED_BUTTON = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [InlineKeyboardButton(text="🐢 Покормил(а)", callback_data="fed")]
-    ]
+# --- Клавиатуры и точки входа ---
+# Метки кнопок нижней клавиатуры (вариант C). Их же текст ловим в обработчиках.
+BTN_FEED = "🐢 Покормил(а)"
+BTN_STATUS = "📊 Статус"
+BTN_HISTORY = "📜 История"
+BTN_SETTINGS = "⚙️ Настройки"
+
+# Нижняя клавиатура — постоянная, всегда под рукой.
+MAIN_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_FEED)],
+        [KeyboardButton(text=BTN_STATUS), KeyboardButton(text=BTN_HISTORY)],
+        [KeyboardButton(text=BTN_SETTINGS)],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
 )
+
+# Одна кнопка «Покормил(а)» — вешается на напоминания и ответы со статусом.
+FEED_BUTTON = InlineKeyboardMarkup(
+    inline_keyboard=[[InlineKeyboardButton(text=BTN_FEED, callback_data="fed")]]
+)
+
+PANEL_TEXT = "🐢 Панель кормления Саши\nВыберите действие (это сообщение можно закрепить):"
+
+
+def panel_kb():
+    """Inline-панель «пульт» (вариант B) — её можно закрепить в чате."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=BTN_FEED, callback_data="fed")],
+            [
+                InlineKeyboardButton(text=BTN_STATUS, callback_data="m:status"),
+                InlineKeyboardButton(text=BTN_HISTORY, callback_data="m:history"),
+            ],
+            [InlineKeyboardButton(text=BTN_SETTINGS, callback_data="m:settings")],
+        ]
+    )
+
+
+def settings_kb():
+    """Редактор настроек кнопками − / + (текущие значения на кнопках)."""
+    s = get_state()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➖", callback_data="s:interval:-1"),
+                InlineKeyboardButton(text=f"🍽 {s['feed_interval_days']} дн", callback_data="noop"),
+                InlineKeyboardButton(text="➕", callback_data="s:interval:1"),
+            ],
+            [
+                InlineKeyboardButton(text="➖", callback_data="s:period:-1"),
+                InlineKeyboardButton(text=f"🔔 {s['remind_every_hours']} ч", callback_data="noop"),
+                InlineKeyboardButton(text="➕", callback_data="s:period:1"),
+            ],
+            [InlineKeyboardButton(text="✖️ Закрыть", callback_data="s:close")],
+        ]
+    )
 
 
 def fmt_dt(iso_str):
@@ -144,56 +199,8 @@ def in_reminder_window(now):
     return REMIND_START_HOUR <= now.hour < REMIND_END_HOUR
 
 
-# --- Обработчики команд ---
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    state = get_state()
-    # Запоминаем чат, куда слать напоминания (последний, где вызвали /start).
-    fields = {"chat_id": message.chat.id}
-    if not state["next_feed_date"]:
-        # Первый запуск — считаем, что кормить пора сегодня, чтобы задать ритм.
-        fields["next_feed_date"] = datetime.now(TZ).date().isoformat()
-    set_state(**fields)
-    await message.answer(
-        "Привет! Я напоминаю кормить черепаху Сашу 🐢\n\n"
-        f"Кормим раз в {FEED_INTERVAL_DAYS} дня. Когда подойдёт срок, я буду писать "
-        f"в этот чат каждый час (с {REMIND_START_HOUR}:00 до {REMIND_END_HOUR}:00), "
-        "пока кто-нибудь не нажмёт кнопку «Покормил(а)».\n\n"
-        "Команды:\n"
-        "/feed — отметить, что покормили\n"
-        "/status — когда следующее кормление\n"
-        "/history — последние 7 кормлений\n"
-        "/settings — текущие настройки\n"
-        "/interval <дни> — раз в сколько дней кормить\n"
-        "/period <часы> — как часто повторять напоминание",
-        reply_markup=FEED_BUTTON,
-    )
-
-
-async def do_feed(user_id, user_name, answer):
-    next_date = record_feeding(user_id, user_name)
-    next_human = datetime.fromisoformat(next_date).strftime("%d.%m.%Y")
-    await answer(
-        f"Готово! {user_name} покормил(а) Сашу 🐢\n"
-        f"Следующее кормление — {next_human}."
-    )
-
-
-@dp.message(Command("feed"))
-async def cmd_feed(message: Message):
-    user = message.from_user
-    await do_feed(user.id, user.full_name, message.answer)
-
-
-@dp.callback_query(F.data == "fed")
-async def cb_fed(callback: CallbackQuery):
-    user = callback.from_user
-    await do_feed(user.id, user.full_name, callback.message.answer)
-    await callback.answer("Записал!")
-
-
-@dp.message(Command("status"))
-async def cmd_status(message: Message):
+# --- Тексты (используются командами, кнопками и inline-панелью) ---
+def status_text():
     state = get_state()
     last = last_feeding()
     lines = []
@@ -209,36 +216,85 @@ async def cmd_status(message: Message):
         else:
             days = (nd - today).days
             lines.append(f"Следующее кормление — {nd.strftime('%d.%m.%Y')} (через {days} дн.)")
-    await message.answer("\n".join(lines), reply_markup=FEED_BUTTON)
+    return "\n".join(lines)
 
 
-@dp.message(Command("history"))
-async def cmd_history(message: Message):
+def history_text():
     with db() as conn:
         rows = conn.execute(
             "SELECT user_name, fed_at FROM feedings ORDER BY id DESC LIMIT 7"
         ).fetchall()
     if not rows:
-        await message.answer("Истории пока нет.")
-        return
+        return "Истории пока нет."
     lines = ["Последние кормления:"]
     for r in rows:
         lines.append(f"• {fmt_dt(r['fed_at'])} — {r['user_name']}")
-    await message.answer("\n".join(lines))
+    return "\n".join(lines)
+
+
+def settings_text():
+    return (
+        "⚙️ Настройки\n"
+        "🍽 Кормить раз в N дней\n"
+        f"🔔 Напоминать раз в N часов (окно {REMIND_START_HOUR}:00–{REMIND_END_HOUR}:00)\n\n"
+        "Меняйте значения кнопками − / + ниже:"
+    )
+
+
+async def do_feed(user_id, user_name, answer):
+    next_date = record_feeding(user_id, user_name)
+    next_human = datetime.fromisoformat(next_date).strftime("%d.%m.%Y")
+    await answer(
+        f"Готово! {user_name} покормил(а) Сашу 🐢\n"
+        f"Следующее кормление — {next_human}."
+    )
+
+
+# --- Команды (вариант A: попадают в меню Telegram) ---
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    state = get_state()
+    # Запоминаем чат, куда слать напоминания (последний, где вызвали /start).
+    fields = {"chat_id": message.chat.id}
+    if not state["next_feed_date"]:
+        # Первый запуск — считаем, что кормить пора сегодня, чтобы задать ритм.
+        fields["next_feed_date"] = datetime.now(TZ).date().isoformat()
+    set_state(**fields)
+    await message.answer(
+        "Привет! Я напоминаю кормить черепаху Сашу 🐢\n\n"
+        f"Кормим раз в {state['feed_interval_days']} дн. Когда подойдёт срок, буду писать "
+        f"в этот чат (с {REMIND_START_HOUR}:00 до {REMIND_END_HOUR}:00), "
+        "пока кто-нибудь не нажмёт «Покормил(а)».\n\n"
+        "Кнопки снизу — для быстрых действий. Ниже — панель, которую удобно закрепить.",
+        reply_markup=MAIN_KB,
+    )
+    await message.answer(PANEL_TEXT, reply_markup=panel_kb())
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message):
+    await message.answer(PANEL_TEXT, reply_markup=panel_kb())
+
+
+@dp.message(Command("feed"))
+async def cmd_feed(message: Message):
+    user = message.from_user
+    await do_feed(user.id, user.full_name, message.answer)
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    await message.answer(status_text(), reply_markup=FEED_BUTTON)
+
+
+@dp.message(Command("history"))
+async def cmd_history(message: Message):
+    await message.answer(history_text())
 
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
-    s = get_state()
-    await message.answer(
-        "Текущие настройки:\n"
-        f"• Кормим раз в {s['feed_interval_days']} дн.\n"
-        f"• Напоминаем каждые {s['remind_every_hours']} ч "
-        f"(в окне {REMIND_START_HOUR}:00–{REMIND_END_HOUR}:00)\n\n"
-        "Изменить:\n"
-        "/interval <дни> — частота кормления\n"
-        "/period <часы> — период напоминаний"
-    )
+    await message.answer(settings_text(), reply_markup=settings_kb())
 
 
 @dp.message(Command("interval"))
@@ -274,6 +330,78 @@ async def cmd_period(message: Message, command: CommandObject):
         return
     set_state(remind_every_hours=int(arg))
     await message.answer(f"Готово: напоминания каждые {int(arg)} ч.")
+
+
+# --- Нижняя клавиатура (вариант C): ловим текст кнопок ---
+@dp.message(F.text == BTN_FEED)
+async def kb_feed(message: Message):
+    await do_feed(message.from_user.id, message.from_user.full_name, message.answer)
+
+
+@dp.message(F.text == BTN_STATUS)
+async def kb_status(message: Message):
+    await message.answer(status_text(), reply_markup=FEED_BUTTON)
+
+
+@dp.message(F.text == BTN_HISTORY)
+async def kb_history(message: Message):
+    await message.answer(history_text())
+
+
+@dp.message(F.text == BTN_SETTINGS)
+async def kb_settings(message: Message):
+    await message.answer(settings_text(), reply_markup=settings_kb())
+
+
+# --- Inline-кнопки (вариант B: панель и напоминания) ---
+@dp.callback_query(F.data == "fed")
+async def cb_fed(callback: CallbackQuery):
+    user = callback.from_user
+    await do_feed(user.id, user.full_name, callback.message.answer)
+    await callback.answer("Записал!")
+
+
+@dp.callback_query(F.data == "m:status")
+async def cb_m_status(callback: CallbackQuery):
+    await callback.message.answer(status_text(), reply_markup=FEED_BUTTON)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "m:history")
+async def cb_m_history(callback: CallbackQuery):
+    await callback.message.answer(history_text())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "m:settings")
+async def cb_m_settings(callback: CallbackQuery):
+    await callback.message.answer(settings_text(), reply_markup=settings_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("s:"))
+async def cb_settings_change(callback: CallbackQuery):
+    if callback.data == "s:close":
+        await callback.message.delete()
+        await callback.answer()
+        return
+    _, field, delta = callback.data.split(":")
+    delta = int(delta)
+    s = get_state()
+    if field == "interval":
+        set_state(feed_interval_days=min(30, max(1, s["feed_interval_days"] + delta)))
+    else:
+        set_state(remind_every_hours=min(24, max(1, s["remind_every_hours"] + delta)))
+    try:
+        await callback.message.edit_reply_markup(reply_markup=settings_kb())
+    except Exception:
+        pass  # значение упёрлось в границу — клавиатура не изменилась, это ок
+    await callback.answer()
 
 
 # --- Фоновый цикл напоминаний ---
@@ -315,8 +443,21 @@ async def maybe_remind():
 
 
 # --- Точка входа ---
+async def set_commands():
+    await bot.set_my_commands(
+        [
+            BotCommand(command="feed", description="🐢 Отметить кормление"),
+            BotCommand(command="status", description="📊 Когда следующее кормление"),
+            BotCommand(command="history", description="📜 Последние кормления"),
+            BotCommand(command="settings", description="⚙️ Настройки"),
+            BotCommand(command="menu", description="📋 Панель с кнопками"),
+        ]
+    )
+
+
 async def main():
     init_db()
+    await set_commands()
     asyncio.create_task(reminder_loop())
     log.info("Бот запущен")
     await dp.start_polling(bot)
